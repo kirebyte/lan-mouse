@@ -75,3 +75,33 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+
+## Clipboard
+The clipboard follows the cursor: when the cursor enters a remote device,
+the local clipboard is pushed to it, and when the cursor returns (the
+remote device sends `Leave`, the release bind is pressed or the client is
+deactivated), the clipboard of the remote device is pulled.
+The local clipboard is only read at these moments - there is no polling.
+
+Both requests are initiated by the capturing device, so only the listening
+side has to accept clipboard connections. Since clipboard contents can be
+large (e.g. screenshots), they are not sent over the DTLS event channel but
+over a separate TLS 1.3 connection (TCP, same port number), one request per
+connection (see `src/clipboard/proto.rs`).
+
+Authentication reuses the DTLS certificates:
+- the listening side only accepts client certificates from the list of
+  authorized fingerprints,
+- the connecting side only accepts the certificate the peer presented over
+  DTLS, so the clipboard is only ever sent to the device that also receives
+  the input events.
+
+Content offering the `x-kde-passwordManagerHint` mime type with the value
+`secret` (set by password managers such as KeePassXC) is only sent if
+`clipboard_allow_secrets` is enabled. Secrets are marked the same way on the
+receiving device, so clipboard managers there do not keep them in history.
+
+Clipboard sharing is disabled by default (`clipboard = true` enables it).
+Currently only a Wayland backend (`wlr-data-control` / `ext-data-control`)
+exists; on other platforms clipboard requests fail with an error status
+and input sharing is not affected.

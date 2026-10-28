@@ -1,5 +1,6 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
+use crate::crypto;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -195,6 +196,7 @@ async fn connect_to_handle(
         };
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_peer_fingerprint(handle, peer_fingerprint(&conn).await);
         conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
 
@@ -228,6 +230,13 @@ async fn connect_to_handle(
     }
     connecting.lock().await.remove(&handle);
     Err(LanMouseConnectionError::NotConnected)
+}
+
+/// fingerprint of the certificate presented by the peer
+async fn peer_fingerprint(conn: &Arc<dyn Conn + Send + Sync>) -> Option<String> {
+    let conn: &DTLSConn = conn.as_any().downcast_ref()?;
+    let certs = conn.connection_state().await.peer_certificates;
+    certs.first().map(|c| crypto::generate_fingerprint(c))
 }
 
 async fn ping_pong(
@@ -305,6 +314,7 @@ async fn disconnect(
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    client_manager.set_peer_fingerprint(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }

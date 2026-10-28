@@ -185,6 +185,9 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// sha256 fingerprint of the certificate the client presented
+    /// over DTLS, used to authenticate it on the clipboard channel
+    pub peer_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +229,8 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// clipboard sharing options
+    ClipboardSettings { enabled: bool, allow_secrets: bool },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -266,6 +271,8 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// update clipboard sharing options
+    UpdateClipboard { enabled: bool, allow_secrets: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

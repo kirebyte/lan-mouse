@@ -410,6 +410,15 @@ impl Window {
         self.request(FrontendRequest::EnableEmulation);
     }
 
+    fn request_clipboard_update(&self) {
+        let enabled = self.imp().clipboard_switch.is_active();
+        let allow_secrets = self.imp().clipboard_secrets_switch.is_active();
+        self.request(FrontendRequest::UpdateClipboard {
+            enabled,
+            allow_secrets,
+        });
+    }
+
     fn request_client_create(&self) {
         self.request(FrontendRequest::Create);
     }
@@ -535,6 +544,14 @@ impl Window {
             authorized.append(&key_obj);
         }
         self.update_auth_placeholder_visibility();
+    }
+
+    pub(super) fn set_clipboard(&self, enabled: bool, allow_secrets: bool) {
+        let imp = self.imp();
+        imp.clipboard_syncing.set(true);
+        imp.clipboard_switch.set_active(enabled);
+        imp.clipboard_secrets_switch.set_active(allow_secrets);
+        imp.clipboard_syncing.set(false);
     }
 
     pub(super) fn set_pk_fp(&self, fingerprint: &str) {

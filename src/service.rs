@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{Clipboard, ClipboardSettings},
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
@@ -33,6 +34,8 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    #[error("failed to set up clipboard sharing: `{0}`")]
+    Clipboard(#[from] rustls::Error),
 }
 
 pub struct Service {
@@ -44,6 +47,8 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// clipboard sharing
+    clipboard: Clipboard,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -105,6 +110,14 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        let clipboard = Clipboard::new(
+            cert.clone(),
+            authorized_keys.clone(),
+            client_manager.clone(),
+            clipboard_settings(&config),
+            config.port(),
+        )?;
+
         let port = config.port();
         let service = Self {
             config,
@@ -112,6 +125,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            clipboard,
             authorized_keys,
             public_key_fingerprint,
             client_manager,
@@ -159,6 +173,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating clipboard ...");
+        self.clipboard.terminate();
 
         Ok(())
     }
@@ -218,6 +234,16 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::UpdateClipboard {
+                enabled,
+                allow_secrets,
+            } => {
+                self.update_clipboard(ClipboardSettings {
+                    enabled,
+                    allow_secrets,
+                });
+                self.save_config();
+            }
         }
     }
 
@@ -238,6 +264,9 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
+        let clipboard = self.clipboard.settings();
+        self.config
+            .set_clipboard(clipboard.enabled, clipboard.allow_secrets);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
@@ -264,6 +293,8 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        self.clipboard
+            .set_settings(clipboard_settings(&self.config));
         self.sync_frontend();
     }
 
@@ -303,6 +334,7 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    self.clipboard.change_port(port);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -354,10 +386,12 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Enter);
+                self.clipboard.push(handle);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
+                self.clipboard.pull(handle);
             }
         }
     }
@@ -397,6 +431,23 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_clipboard_settings();
+    }
+
+    fn update_clipboard(&mut self, settings: ClipboardSettings) {
+        self.clipboard.set_settings(settings);
+        self.notify_clipboard_settings();
+    }
+
+    fn notify_clipboard_settings(&mut self) {
+        let ClipboardSettings {
+            enabled,
+            allow_secrets,
+        } = self.clipboard.settings();
+        self.notify_frontend(FrontendEvent::ClipboardSettings {
+            enabled,
+            allow_secrets,
+        });
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -621,6 +672,13 @@ impl Service {
                 Err(e) => log::warn!("{kind} hook for client {handle} ({cmd}): {e}"),
             }
         });
+    }
+}
+
+fn clipboard_settings(config: &Config) -> ClipboardSettings {
+    ClipboardSettings {
+        enabled: config.clipboard(),
+        allow_secrets: config.clipboard_allow_secrets(),
     }
 }
 

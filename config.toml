@@ -6,6 +6,13 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# share the clipboard (text and images) with the device
+# the cursor moves to (defaults to false)
+clipboard = true
+# also send content marked as secret by a password manager,
+# e.g. passwords copied from KeePassXC (defaults to false)
+clipboard_allow_secrets = false
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]

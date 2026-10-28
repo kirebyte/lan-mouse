@@ -4,7 +4,7 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
+use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, Switch, gdk, gio, glib};
 
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
@@ -45,6 +45,12 @@ pub struct Window {
     pub input_capture_button: TemplateChild<Button>,
     #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub clipboard_switch: TemplateChild<Switch>,
+    #[template_child]
+    pub clipboard_secrets_switch: TemplateChild<Switch>,
+    /// set while switches are updated from service state
+    pub clipboard_syncing: Cell<bool>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -177,6 +183,13 @@ impl Window {
             macos_privacy::open_accessibility_settings();
         }
         self.obj().request_capture();
+    }
+
+    #[template_callback]
+    fn handle_clipboard_toggled(&self) {
+        if !self.clipboard_syncing.get() {
+            self.obj().request_clipboard_update();
+        }
     }
 
     #[template_callback]

@@ -69,6 +69,8 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    clipboard: Option<bool>,
+    clipboard_allow_secrets: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -498,6 +500,29 @@ impl Config {
             .as_ref()
             .and_then(|c| c.release_bind.clone())
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
+    }
+
+    /// share the clipboard with other devices (default: off)
+    pub fn clipboard(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard)
+            .unwrap_or(false)
+    }
+
+    /// also send clipboard content marked as secret by a password manager (default: off)
+    pub fn clipboard_allow_secrets(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_allow_secrets)
+            .unwrap_or(false)
+    }
+
+    /// set clipboard sharing options
+    pub fn set_clipboard(&mut self, enabled: bool, allow_secrets: bool) {
+        let config = self.config_toml.get_or_insert_with(Default::default);
+        config.clipboard = Some(enabled);
+        config.clipboard_allow_secrets = Some(allow_secrets);
     }
 
     /// set configured clients

@@ -305,6 +305,10 @@ fn build_ui(app: &Application) {
                     FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
                     FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
                     FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
+                    FrontendEvent::ClipboardSettings {
+                        enabled,
+                        allow_secrets,
+                    } => window.set_clipboard(enabled, allow_secrets),
                     FrontendEvent::ConnectionAttempt { fingerprint } => {
                         window.request_authorization(&fingerprint);
                     }

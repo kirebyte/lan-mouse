@@ -328,6 +328,7 @@ It is of the form "aa:bb:cc:..."
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
 
 If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
+Clipboard sharing additionally uses TCP on the same port.
 </details>
 
 <details>
@@ -395,6 +396,13 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# share the clipboard (text and images) with the device
+# the cursor moves to (defaults to false)
+clipboard = true
+# also send content marked as secret by a password manager,
+# e.g. passwords copied from KeePassXC (defaults to false)
+clipboard_allow_secrets = false
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
@@ -439,7 +447,7 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard support (text and images; Linux / Wayland)
 
 
 ## Detailed OS Support

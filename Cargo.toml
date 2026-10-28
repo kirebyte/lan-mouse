@@ -64,12 +64,19 @@ rustls = { version = "0.23.12", default-features = false, features = [
     "std",
     "ring",
 ] }
+tokio-rustls = { version = "0.26.0", default-features = false, features = [
+    "ring",
+] }
 rcgen = "0.13.1"
 sha2 = "0.10.8"
+num_enum = "0.7.2"
 notify = "8.2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wl-clipboard-rs = { version = "0.9.5", optional = true }
 
 [features]
 default = [
@@ -81,6 +88,7 @@ default = [
     "libei_emulation",
     "rdp_emulation",
     "x11_emulation",
+    "wayland_clipboard",
 ]
 gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
@@ -90,6 +98,7 @@ libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
+wayland_clipboard = ["dep:wl-clipboard-rs"]
 
 [package.metadata.bundle]
 name = "Lan Mouse"
