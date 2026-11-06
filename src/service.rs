@@ -314,6 +314,9 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // disarm our own barrier at this edge for a moment, so
+                // the pointer is not bounced straight back to the peer
+                self.capture.peer_entered(pos);
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());

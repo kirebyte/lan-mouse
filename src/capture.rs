@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -68,6 +69,57 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// a remote device entered this device through the given edge
+    PeerEntered(Position),
+}
+
+/// Cooldown per screen edge, so that a barrier is not re-triggered
+/// right after the same edge was crossed in the opposite direction.
+///
+/// When a peer enters this device through an edge, our own capture at
+/// that edge is released and the pointer is placed right next to the
+/// barrier. Any outward motion in the following instants (the peer's
+/// device still pushing, jitter, a drifting trackpoint, events that were
+/// still in flight) would otherwise fire our barrier again, kick the
+/// pointer back to the peer, which in turn releases *its* capture next
+/// to *its* barrier, and so on: an enter/leave ping-pong that never
+/// settles. The same mechanism is used to back off after a failed send,
+/// which otherwise retries at the full input event rate.
+#[derive(Debug, Default)]
+pub(crate) struct EdgeGuard {
+    blocked_until: HashMap<Position, Instant>,
+}
+
+impl EdgeGuard {
+    /// how long our own barrier at an edge stays disarmed after a
+    /// peer entered through it
+    pub(crate) const PEER_ENTER_GRACE: Duration = Duration::from_millis(500);
+    /// how long an edge stays disarmed after sending to its client failed
+    pub(crate) const SEND_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
+
+    fn block(&mut self, pos: Position, until: Instant) {
+        let entry = self.blocked_until.entry(pos).or_insert(until);
+        if *entry < until {
+            *entry = until;
+        }
+    }
+
+    /// a peer entered this device through `pos` at time `now`
+    pub(crate) fn peer_entered(&mut self, pos: Position, now: Instant) {
+        self.block(pos, now + Self::PEER_ENTER_GRACE);
+    }
+
+    /// sending to the client at `pos` failed at time `now`
+    pub(crate) fn send_failed(&mut self, pos: Position, now: Instant) {
+        self.block(pos, now + Self::SEND_FAILURE_BACKOFF);
+    }
+
+    /// whether a capture beginning at `pos` at time `now` must be ignored
+    pub(crate) fn is_blocked(&self, pos: Position, now: Instant) -> bool {
+        self.blocked_until
+            .get(&pos)
+            .is_some_and(|&until| now < until)
+    }
 }
 
 impl Capture {
@@ -89,6 +141,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            edge_guard: Default::default(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -144,6 +197,13 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    /// notify the capture that a remote device entered this device
+    /// through the edge at `pos`
+    pub(crate) fn peer_entered(&self, pos: lan_mouse_ipc::Position) {
+        let pos = to_capture_pos(pos);
+        let _ = self.request_tx.send(CaptureRequest::PeerEntered(pos));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -173,6 +233,7 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    edge_guard: EdgeGuard,
 }
 
 impl CaptureTask {
@@ -220,6 +281,9 @@ impl CaptureTask {
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
+                        }
+                        CaptureRequest::PeerEntered(pos) => {
+                            self.edge_guard.peer_entered(pos, Instant::now());
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -324,6 +388,9 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::PeerEntered(pos) => {
+                        self.edge_guard.peer_entered(pos, Instant::now());
+                    }
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -342,6 +409,19 @@ impl CaptureTask {
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
+        }
+
+        let pos = self.get_pos(handle);
+
+        // The edge was just used in the opposite direction (a peer entered
+        // through it) or sending to its client just failed: do not start
+        // a new capture, just put the pointer back inside the screen.
+        // Neither the default client (`Enter`) nor the incoming connection
+        // (`Leave`) at this edge must be notified, otherwise the peer is
+        // kicked out again.
+        if event == CaptureEvent::Begin && self.edge_guard.is_blocked(pos, Instant::now()) {
+            log::debug!("ignoring capture at {pos}: edge on cooldown");
+            return capture.release().await;
         }
 
         if event == CaptureEvent::Begin {
@@ -371,7 +451,17 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        // Input events only make sense for the client we are currently
+        // sending to. Events for any other handle are stragglers: the
+        // compositor keeps forwarding input for a few milliseconds after
+        // we asked it to release the capture (or after a `Begin` that was
+        // ignored above). Forwarding those to the peer would move the
+        // pointer that was just handed back to it.
+        if self.active_client != Some(handle) {
+            return Ok(());
+        }
+
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let event = match event {
             CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
@@ -385,6 +475,10 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            // Back off: without this, the pointer is released next to the
+            // barrier and the next motion event re-enters the client at
+            // the full input event rate.
+            self.edge_guard.send_failed(pos, Instant::now());
             // Funnel through release_capture so the leave_hook
             // fires and active_client is cleared (without this the
             // active_client field would stay stale until the next
@@ -495,5 +589,78 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_guard_is_open_by_default() {
+        let guard = EdgeGuard::default();
+        let now = Instant::now();
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            assert!(!guard.is_blocked(pos, now));
+        }
+    }
+
+    #[test]
+    fn edge_guard_blocks_edge_after_peer_entered() {
+        let mut guard = EdgeGuard::default();
+        let t0 = Instant::now();
+        guard.peer_entered(Position::Right, t0);
+
+        // blocked right away and for the whole grace period
+        assert!(guard.is_blocked(Position::Right, t0));
+        assert!(guard.is_blocked(
+            Position::Right,
+            t0 + EdgeGuard::PEER_ENTER_GRACE - Duration::from_millis(1)
+        ));
+        // open again once the grace period is over
+        assert!(!guard.is_blocked(Position::Right, t0 + EdgeGuard::PEER_ENTER_GRACE));
+
+        // other edges are not affected
+        assert!(!guard.is_blocked(Position::Left, t0));
+        assert!(!guard.is_blocked(Position::Top, t0));
+        assert!(!guard.is_blocked(Position::Bottom, t0));
+    }
+
+    #[test]
+    fn edge_guard_backs_off_after_send_failure() {
+        let mut guard = EdgeGuard::default();
+        let t0 = Instant::now();
+        guard.send_failed(Position::Top, t0);
+        assert!(guard.is_blocked(Position::Top, t0));
+        assert!(guard.is_blocked(
+            Position::Top,
+            t0 + EdgeGuard::SEND_FAILURE_BACKOFF - Duration::from_millis(1)
+        ));
+        assert!(!guard.is_blocked(Position::Top, t0 + EdgeGuard::SEND_FAILURE_BACKOFF));
+    }
+
+    #[test]
+    fn edge_guard_keeps_the_latest_deadline() {
+        let mut guard = EdgeGuard::default();
+        let t0 = Instant::now();
+        // a longer block is not shortened by a later, shorter one
+        guard.send_failed(Position::Left, t0);
+        guard.peer_entered(Position::Left, t0);
+        assert!(guard.is_blocked(
+            Position::Left,
+            t0 + EdgeGuard::SEND_FAILURE_BACKOFF - Duration::from_millis(1)
+        ));
+        // repeated enters (the peer resends `Enter` until acknowledged)
+        // extend the grace period from the latest one
+        let t1 = t0 + Duration::from_millis(300);
+        guard.peer_entered(Position::Right, t0);
+        guard.peer_entered(Position::Right, t1);
+        assert!(guard.is_blocked(Position::Right, t1 + Duration::from_millis(400)));
+        assert!(!guard.is_blocked(Position::Right, t1 + EdgeGuard::PEER_ENTER_GRACE));
     }
 }

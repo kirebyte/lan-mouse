@@ -91,6 +91,11 @@ pub struct LibeiInputCapture {
 fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
     let (x, y) = (r.x_offset(), r.y_offset());
     let (w, h) = (r.width() as i32, r.height() as i32);
+    rect_to_barrier((x, y, w, h), pos)
+}
+
+/// barrier line segment for the given edge of the rectangle `(x, y, w, h)`
+fn rect_to_barrier((x, y, w, h): (i32, i32, i32, i32), pos: Position) -> (i32, i32, i32, i32) {
     match pos {
         Position::Left => (x, y, x, y + h - 1),
         Position::Right => (x + w, y, x + w, y + h - 1),
@@ -443,6 +448,13 @@ async fn do_capture_session(
                     };
                     current_pos.replace(Some(pos));
 
+                    // geometry of the barrier that was hit, used to
+                    // compute a safe release position later on
+                    let barrier = barriers
+                        .iter()
+                        .find(|b| b.barrier_id == barrier_id)
+                        .map(|b| b.position);
+
                     // client entered => send event
                     event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
 
@@ -460,7 +472,7 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    release_capture(input_capture, session, activated, pos, barrier).await?;
 
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
@@ -499,11 +511,60 @@ async fn do_capture_session(
     Ok(())
 }
 
+/// Distance (in logical pixels) between the barrier and the position
+/// at which the pointer is placed when the capture is released.
+///
+/// The compositor may report the *unclamped* cursor position in the
+/// activation, i.e. a point beyond the screen edge by the full delta of
+/// the motion event that hit the barrier (KWin does this). Offsetting
+/// that point by a single pixel is then not enough: the release position
+/// is still outside the screen, the compositor clamps it back onto the
+/// barrier line and the very next motion event towards the edge
+/// re-activates the capture. On symmetric setups (both sides have a
+/// client at the shared edge) this turns into an enter/leave ping-pong
+/// between the two devices. So the release position is derived from the
+/// barrier geometry instead of the reported cursor position, and placed
+/// a few pixels inside the screen.
+const RELEASE_OFFSET: f64 = 8.;
+
+/// Compute the pointer position at which a capture is released.
+///
+/// * `barrier` - the (inclusive) line segment `(x1, y1, x2, y2)` of the
+///   barrier that was hit, as passed to the compositor
+/// * `pos` - the client position the barrier belongs to
+/// * `cursor` - the cursor position reported in the activation (may lie
+///   outside the screen)
+///
+/// The returned position lies [`RELEASE_OFFSET`] pixels inside the
+/// barrier, with the coordinate along the barrier clamped to the segment.
+fn release_position(
+    barrier: (i32, i32, i32, i32),
+    pos: Position,
+    cursor: (f32, f32),
+) -> (f64, f64) {
+    let (x1, y1, x2, y2) = (
+        barrier.0 as f64,
+        barrier.1 as f64,
+        barrier.2 as f64,
+        barrier.3 as f64,
+    );
+    let (cx, cy) = (cursor.0 as f64, cursor.1 as f64);
+    let (xmin, xmax) = (x1.min(x2), x1.max(x2));
+    let (ymin, ymax) = (y1.min(y2), y1.max(y2));
+    match pos {
+        Position::Left => (xmin + RELEASE_OFFSET, cy.clamp(ymin, ymax)),
+        Position::Right => (xmin - RELEASE_OFFSET, cy.clamp(ymin, ymax)),
+        Position::Top => (cx.clamp(xmin, xmax), ymin + RELEASE_OFFSET),
+        Position::Bottom => (cx.clamp(xmin, xmax), ymin - RELEASE_OFFSET),
+    }
+}
+
 async fn release_capture(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    barrier: Option<(i32, i32, i32, i32)>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -512,15 +573,21 @@ async fn release_capture(
         .cursor_position()
         .expect("compositor did not report cursor position!");
     log::debug!("client entered @ ({x}, {y})");
-    let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
-        Position::Left => (1., 0.),
-        Position::Right => (-1., 0.),
-        Position::Top => (0., 1.),
-        Position::Bottom => (0., -1.),
+    let cursor_position = match barrier {
+        Some(barrier) => release_position(barrier, current_pos, (x, y)),
+        // barrier geometry unknown: fall back to offsetting the
+        // reported position by a single pixel
+        None => {
+            let (dx, dy) = match current_pos {
+                Position::Left => (1., 0.),
+                Position::Right => (-1., 0.),
+                Position::Top => (0., 1.),
+                Position::Bottom => (0., -1.),
+            };
+            (x as f64 + dx, y as f64 + dy)
+        }
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
+    log::debug!("releasing pointer @ {cursor_position:?}");
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
         .set_cursor_position(Some(cursor_position));
@@ -665,5 +732,66 @@ impl Stream for LibeiInputCapture {
             },
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: i32 = 1920;
+    const H: i32 = 1080;
+
+    fn barrier(pos: Position) -> (i32, i32, i32, i32) {
+        rect_to_barrier((0, 0, W, H), pos)
+    }
+
+    #[test]
+    fn release_position_is_inside_the_screen_despite_overshoot() {
+        // the compositor reports the unclamped target of the motion that
+        // hit the barrier, i.e. a point beyond the screen edge
+        let (x, y) = release_position(barrier(Position::Right), Position::Right, (1927., 500.));
+        assert_eq!((x, y), (W as f64 - RELEASE_OFFSET, 500.));
+
+        let (x, y) = release_position(barrier(Position::Left), Position::Left, (-6., 500.));
+        assert_eq!((x, y), (RELEASE_OFFSET, 500.));
+
+        let (x, y) = release_position(barrier(Position::Top), Position::Top, (700., -12.));
+        assert_eq!((x, y), (700., RELEASE_OFFSET));
+
+        let (x, y) = release_position(barrier(Position::Bottom), Position::Bottom, (700., 1099.));
+        assert_eq!((x, y), (700., H as f64 - RELEASE_OFFSET));
+    }
+
+    #[test]
+    fn release_position_ignores_reported_coordinate_across_the_barrier() {
+        // a slow approach reports a point right on the edge: the result
+        // must not depend on it
+        let (x, _) = release_position(barrier(Position::Right), Position::Right, (1920., 10.));
+        assert_eq!(x, W as f64 - RELEASE_OFFSET);
+        let (x, _) = release_position(barrier(Position::Right), Position::Right, (1919., 10.));
+        assert_eq!(x, W as f64 - RELEASE_OFFSET);
+    }
+
+    #[test]
+    fn release_position_clamps_along_the_barrier() {
+        let (_, y) = release_position(barrier(Position::Right), Position::Right, (1930., 1200.));
+        assert_eq!(y, (H - 1) as f64);
+        let (_, y) = release_position(barrier(Position::Left), Position::Left, (-1., -50.));
+        assert_eq!(y, 0.);
+        let (x, _) = release_position(barrier(Position::Top), Position::Top, (2500., -1.));
+        assert_eq!(x, (W - 1) as f64);
+    }
+
+    #[test]
+    fn release_position_honours_region_offset() {
+        // second monitor to the right of a 1920 wide one
+        let region = (1920, 0, 2560, 1440);
+        let b = rect_to_barrier(region, Position::Right);
+        let (x, y) = release_position(b, Position::Right, (4500., 100.));
+        assert_eq!((x, y), ((1920 + 2560) as f64 - RELEASE_OFFSET, 100.));
+        let b = rect_to_barrier(region, Position::Left);
+        let (x, _) = release_position(b, Position::Left, (1900., 100.));
+        assert_eq!(x, 1920. + RELEASE_OFFSET);
     }
 }
