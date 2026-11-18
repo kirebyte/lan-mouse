@@ -69,6 +69,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// set recenter bind (empty: disabled)
+    SetRecenterBind(Vec<scancode::Linux>),
     /// a remote device entered this device through the given edge
     PeerEntered(Position),
 }
@@ -127,6 +129,7 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        recenter_bind: Vec<scancode::Linux>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -140,6 +143,7 @@ impl Capture {
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
+            recenter_bind,
             state: Default::default(),
             edge_guard: Default::default(),
         };
@@ -198,6 +202,10 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
+    pub(crate) fn set_recenter_bind(&mut self, bind: Vec<scancode::Linux>) {
+        let _ = self.request_tx.send(CaptureRequest::SetRecenterBind(bind));
+    }
+
     /// notify the capture that a remote device entered this device
     /// through the edge at `pos`
     pub(crate) fn peer_entered(&self, pos: lan_mouse_ipc::Position) {
@@ -231,6 +239,9 @@ struct CaptureTask {
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
+    /// keys that release the capture and leave the pointer in the center
+    /// of the local screen; disabled if empty
+    recenter_bind: Vec<scancode::Linux>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
     edge_guard: EdgeGuard,
@@ -282,6 +293,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::SetRecenterBind(bind) => self.recenter_bind = bind,
                         CaptureRequest::PeerEntered(pos) => {
                             self.edge_guard.peer_entered(pos, Instant::now());
                         }
@@ -359,14 +371,14 @@ impl CaptureTask {
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, false).await?;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release => self.release_capture(capture, false).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -380,7 +392,7 @@ impl CaptureTask {
                         // `cli deactivate` (or a hostname change
                         // re-creating the client) would skip leave_hook.
                         if self.active_client == Some(h) {
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, false).await?;
                         }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
@@ -388,6 +400,7 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::SetRecenterBind(bind) => self.recenter_bind = bind,
                     CaptureRequest::PeerEntered(pos) => {
                         self.edge_guard.peer_entered(pos, Instant::now());
                     }
@@ -408,7 +421,15 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+            return self.release_capture(capture, false).await;
+        }
+
+        // Same as the release bind, but the pointer is left in the center
+        // of the local screen. An empty bind disables the feature
+        // (`keys_pressed` is trivially true for an empty list).
+        if !self.recenter_bind.is_empty() && capture.keys_pressed(&self.recenter_bind) {
+            log::info!("releasing capture: recenter-bind pressed");
+            return self.release_capture(capture, true).await;
         }
 
         let pos = self.get_pos(handle);
@@ -483,12 +504,19 @@ impl CaptureTask {
             // fires and active_client is cleared (without this the
             // active_client field would stay stale until the next
             // Begin from a different handle).
-            self.release_capture(capture).await?;
+            self.release_capture(capture, false).await?;
         }
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    /// Release the capture. With `center`, the pointer is left in the
+    /// center of the local screen instead of next to the barrier
+    /// (if the capture backend supports it).
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        center: bool,
+    ) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -538,7 +566,11 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        capture.release().await
+        if center {
+            capture.release_centered().await
+        } else {
+            capture.release().await
+        }
     }
 }
 

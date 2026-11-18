@@ -393,6 +393,12 @@ To create this file you can copy the following example config:
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
+# optional: like release_bind, but the cursor is left in the center of
+# the screen instead of at the edge it left through (disabled if unset;
+# centering needs the input-capture-portal backend, other backends do a
+# regular release)
+# recenter_bind = [ "KeyPause" ]
+
 # optional port (defaults to 4242)
 port = 4242
 

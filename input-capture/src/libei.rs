@@ -23,7 +23,10 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 use tokio::{
@@ -83,15 +86,22 @@ pub struct LibeiInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
+    /// leave the pointer in the center of the screen on the next release
+    center_on_release: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
     terminated: bool,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
+/// the rectangle `(x, y, w, h)` covered by a zone of the portal
+fn region_rect(r: &Region) -> (i32, i32, i32, i32) {
     let (x, y) = (r.x_offset(), r.y_offset());
     let (w, h) = (r.width() as i32, r.height() as i32);
-    rect_to_barrier((x, y, w, h), pos)
+    (x, y, w, h)
+}
+
+/// center of the rectangle `(x, y, w, h)`
+fn rect_center((x, y, w, h): (i32, i32, i32, i32)) -> (f64, f64) {
+    (x as f64 + w as f64 / 2., y as f64 + h as f64 / 2.)
 }
 
 /// barrier line segment for the given edge of the rectangle `(x, y, w, h)`
@@ -109,13 +119,20 @@ fn rect_to_barrier((x, y, w, h): (i32, i32, i32, i32), pos: Position) -> (i32, i
 struct ICBarrier {
     barrier_id: BarrierID,
     position: (i32, i32, i32, i32),
+    /// the zone `(x, y, w, h)` this barrier is an edge of
+    region: (i32, i32, i32, i32),
 }
 
 impl ICBarrier {
-    fn new(barrier_id: BarrierID, position: (i32, i32, i32, i32)) -> Self {
+    fn new(
+        barrier_id: BarrierID,
+        position: (i32, i32, i32, i32),
+        region: (i32, i32, i32, i32),
+    ) -> Self {
         Self {
             barrier_id,
             position,
+            region,
         }
     }
 }
@@ -143,9 +160,10 @@ fn select_barriers(
                 *next_barrier_id = next_barrier_id
                     .checked_add(1)
                     .expect("barrier id out of range");
-                let position = pos_to_barrier(r, *pos);
+                let region = region_rect(r);
+                let position = rect_to_barrier(region, *pos);
                 pos_for_barrier.insert(id, *pos);
-                ICBarrier::new(id, position)
+                ICBarrier::new(id, position, region)
             })
             .collect();
         barriers.append(&mut client_barriers);
@@ -244,13 +262,14 @@ impl LibeiInputCapture {
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
         let notify_release = Arc::new(Notify::new());
+        let center_on_release = Arc::new(AtomicBool::new(false));
 
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
             input_capture_ptr,
             notify_rx,
-            notify_release.clone(),
+            (notify_release.clone(), center_on_release.clone()),
             first_session,
             event_tx,
             cancellation_token.clone(),
@@ -263,6 +282,7 @@ impl LibeiInputCapture {
             capture_task,
             notify_capture,
             notify_release,
+            center_on_release,
             cancellation_token,
             terminated: false,
         };
@@ -274,12 +294,13 @@ impl LibeiInputCapture {
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    release: (Arc<Notify>, Arc<AtomicBool>),
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
+    let (notify_release, center_on_release) = release;
 
     /* safety: libei_task does not outlive Self */
     let input_capture = unsafe { &*input_capture };
@@ -332,7 +353,7 @@ async fn do_capture(
                 &event_tx,
                 &active_clients,
                 &mut next_barrier_id,
-                &notify_release,
+                (&notify_release, &center_on_release),
                 (cancel_session.clone(), cancel_update.clone()),
             );
 
@@ -375,10 +396,11 @@ async fn do_capture_session(
     event_tx: &Sender<(Position, CaptureEvent)>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
+    release: (&Notify, &AtomicBool),
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
     let (cancel_session, cancel_update) = cancel;
+    let (notify_release, center_on_release) = release;
     // current client
     let current_pos = Rc::new(Cell::new(None));
 
@@ -453,14 +475,20 @@ async fn do_capture_session(
                     let barrier = barriers
                         .iter()
                         .find(|b| b.barrier_id == barrier_id)
-                        .map(|b| b.position);
+                        .copied();
+
+                    // a centered release only applies to the capture it
+                    // was requested for: drop stale requests
+                    center_on_release.store(false, Ordering::Relaxed);
+                    let mut center = false;
 
                     // client entered => send event
                     event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
-                            log::debug!("release session requested");
+                            center = center_on_release.swap(false, Ordering::Relaxed);
+                            log::debug!("release session requested (center: {center})");
                         },
                         _ = release_session.notified() => { /* release session */
                             log::debug!("ei devices changed");
@@ -472,10 +500,11 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos, barrier).await?;
+                    release_capture(input_capture, session, activated, pos, barrier, center).await?;
 
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
+                    center_on_release.store(false, Ordering::Relaxed);
                     log::debug!("release session requested");
                 },
                 _ = release_session.notified() => { /* release session */
@@ -564,7 +593,8 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
-    barrier: Option<(i32, i32, i32, i32)>,
+    barrier: Option<ICBarrier>,
+    center: bool,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -574,7 +604,9 @@ async fn release_capture(
         .expect("compositor did not report cursor position!");
     log::debug!("client entered @ ({x}, {y})");
     let cursor_position = match barrier {
-        Some(barrier) => release_position(barrier, current_pos, (x, y)),
+        // center of the zone (screen) the capture was started from
+        Some(barrier) if center => rect_center(barrier.region),
+        Some(barrier) => release_position(barrier.position, current_pos, (x, y)),
         // barrier geometry unknown: fall back to offsetting the
         // reported position by a single pixel
         None => {
@@ -697,6 +729,10 @@ impl LanMouseInputCapture for LibeiInputCapture {
         Ok(())
     }
 
+    fn center_on_next_release(&mut self) {
+        self.center_on_release.store(true, Ordering::Relaxed);
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
         let task = &mut self.capture_task;
@@ -793,5 +829,21 @@ mod tests {
         let b = rect_to_barrier(region, Position::Left);
         let (x, _) = release_position(b, Position::Left, (1900., 100.));
         assert_eq!(x, 1920. + RELEASE_OFFSET);
+    }
+
+    #[test]
+    fn rect_center_is_the_middle_of_the_zone() {
+        assert_eq!(rect_center((0, 0, W, H)), (960., 540.));
+        // odd sizes end up between two pixels
+        assert_eq!(rect_center((0, 0, 1281, 801)), (640.5, 400.5));
+    }
+
+    #[test]
+    fn rect_center_honours_region_offset() {
+        // second monitor to the right of a 1920 wide one: the center must
+        // be the center of that monitor, not of the whole desktop
+        assert_eq!(rect_center((1920, 0, 2560, 1440)), (3200., 720.));
+        // monitor above the primary one (negative offset)
+        assert_eq!(rect_center((0, -1080, W, H)), (960., -540.));
     }
 }

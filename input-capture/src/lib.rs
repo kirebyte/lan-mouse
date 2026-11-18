@@ -171,6 +171,16 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// release mouse, leaving the pointer in the center of the screen
+    /// the capture was started from instead of next to the barrier.
+    ///
+    /// Backends that can not position the pointer on release fall back
+    /// to a regular [`InputCapture::release`].
+    pub async fn release_centered(&mut self) -> Result<(), CaptureError> {
+        self.capture.center_on_next_release();
+        self.release().await
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -286,6 +296,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Ask the backend to leave the pointer in the center of the screen
+    /// on the next [`Capture::release`] of the currently active capture.
+    /// The default is a no-op, i.e. a regular release.
+    fn center_on_next_release(&mut self) {}
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

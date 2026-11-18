@@ -66,6 +66,7 @@ struct ConfigToml {
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
+    recenter_bind: Option<Vec<scancode::Linux>>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
@@ -502,6 +503,15 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// bind for returning control to the host with the pointer in the
+    /// center of the screen (default: none, i.e. disabled)
+    pub fn recenter_bind(&self) -> Vec<scancode::Linux> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.recenter_bind.clone())
+            .unwrap_or_default()
+    }
+
     /// share the clipboard with other devices (default: off)
     pub fn clipboard(&self) -> bool {
         self.config_toml
@@ -607,5 +617,25 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recenter_bind_is_off_by_default() {
+        let toml: ConfigToml = toml::from_str("port = 4242\n").unwrap();
+        assert_eq!(toml.recenter_bind, None);
+    }
+
+    #[test]
+    fn recenter_bind_is_parsed_like_release_bind() {
+        let toml: ConfigToml = toml::from_str("recenter_bind = [\"KeyPause\"]\n").unwrap();
+        assert_eq!(toml.recenter_bind, Some(vec![scancode::Linux::KeyPause]));
+        // survives a config write-back
+        let written = toml::to_string_pretty(&toml).unwrap();
+        assert_eq!(toml::from_str::<ConfigToml>(&written).unwrap(), toml);
     }
 }
