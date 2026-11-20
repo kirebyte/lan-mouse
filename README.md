@@ -1,5 +1,17 @@
 # Lan Mouse
 
+> **This is the FoxyByte fork** ([kirebyte/lan-mouse](https://github.com/kirebyte/lan-mouse)) of [feschber/lan-mouse](https://github.com/feschber/lan-mouse).
+> `main` tracks upstream `main` plus the changes below; upstream changes are reviewed and tested before being merged in.
+> Releases are tagged `v<upstream version>-fb<n>`.
+>
+> | Change | Status upstream |
+> |---|---|
+> | Clipboard sharing (text and images, Wayland only, secrets are opt-in) | not proposed yet |
+> | No more enter/leave ping-pong at screen edges shared by two machines | not proposed yet |
+> | Connect as soon as a client is activated, and re-resolve its hostname after a failed send | [#548](https://github.com/feschber/lan-mouse/pull/548), open |
+>
+> Compatibility: like upstream `main`, this build does not interoperate with the **0.11.0 release** ([#559](https://github.com/feschber/lan-mouse/issues/559)); run the same build on every machine.
+
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
 [![crates.io](https://img.shields.io/crates/v/lan-mouse.svg)](https://crates.io/crates/lan-mouse)  [![license](https://img.shields.io/crates/l/lan-mouse.svg)](https://github.com/feschber/lan-mouse/blob/main/Cargo.toml)
